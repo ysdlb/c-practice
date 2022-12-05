@@ -1,0 +1,39 @@
+# reference: https://www.gnu.org/software/make/manual/html_node/Concept-Index.html
+
+SRCS = $(wildcard *.c)
+SUBDIRS = $(wildcard */) # if has sub dirs 'foo, boo', return foo/, boo/
+CUR_PATH = $(shell pwd)/
+SUB_PATHS = $(foreach t,$(SUBDIRS),$(addprefix $(CUR_PATH), $t))
+
+# https://www.gnu.org/software/make/manual/html_node/Text-Functions.html
+PROGS = $(patsubst %.c,%,$(SRCS))
+
+.DEFAULT_GOAL := all
+
+# make conditional or a receipt: https://stackoverflow.com/questions/64368002/ifdef-conditional-unexpected-behavior
+echo:
+#ifdef SUB_PATHS: https://stackoverflow.com/questions/22991068/ifdef-make-3-81-invalid-syntax-in-conditional
+ifneq ($(strip $(SUB_PATHS)),)
+	@echo 'sub_paths -> [$(SUB_PATHS)]'
+endif
+
+all: $(PROGS) sub
+
+%: %.c
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo '$@ compile done'
+
+# $(MAKE) -C ${SUB_PATHS} all		https://stackoverflow.com/questions/15661951/makefile-foreach-make-c-call
+sub:
+ifneq ($(strip $(SUB_PATHS)),)
+	$(foreach SUB_PATH, $(SUB_PATHS), $(MAKE) -C $(SUB_PATH) all )
+endif
+
+clean:
+	rm -f $(PROGS)
+ifneq ($(strip $(SUB_PATHS)),)
+	$(foreach SUB_PATH, $(SUB_PATHS), $(MAKE) -C $(SUB_PATH) clean )
+endif
+
+# https://stackoverflow.com/questions/2145590/what-is-the-purpose-of-phony-in-a-makefile
+.PHONY: all clean sub

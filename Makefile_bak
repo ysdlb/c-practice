@@ -1,0 +1,29 @@
+SUBDIRS := $(wildcard */.)  # e.g. "foo/. bar/."
+TARGETS := all clean  # whatever else, but must not contain '/'
+
+# foo/.all bar/.all foo/.clean bar/.clean
+# https://www.gnu.org/software/make/manual/html_node/Foreach-Function.html
+SUBDIRS_TARGETS := \
+    $(foreach t,$(TARGETS),$(addsuffix $t,$(SUBDIRS)))
+
+echo:
+	@echo 'var t -> $(t)'
+	@echo 'var SUBDIRS -> $(SUBDIRS)'
+	@echo 'var SUBDIRS_TARGETS -> $(SUBDIRS_TARGETS)'
+
+.PHONY : $(TARGETS) $(SUBDIRS_TARGETS)
+
+# static pattern rule, expands into:
+# all clean : % : foo/.% bar/.%
+$(TARGETS) : % : $(addsuffix %,$(SUBDIRS))
+	@echo 'Done "$*" target'
+
+# here, for foo/.all:
+#   $(@D) is foo
+#   $(@F) is .all, with leading period
+#   $(@F:.%=%) is just all
+$(SUBDIRS_TARGETS) :
+	$(MAKE) -C $(@D) $(@F:.%=%)
+
+# todo subSystem
+# https://www.gnu.org/software/make/manual/make.html#Recursion
