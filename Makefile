@@ -4,10 +4,14 @@ CLEAN_SUBDIRS := $(addsuffix .clean, $(SUBDIRS))
 
 EXE_SUFFIX = .out
 
-PROGS = $(patsubst %.c, %, $(SRCS))
-CLEAN_PROGS := $(addsuffix $(EXE_SUFFIX), $(PROGS))
+FILES = $(patsubst %.c, %, $(SRCS))
+PROGS := $(addsuffix $(EXE_SUFFIX), $(FILES))
 
 .DEFAULT_GOAL := all
+
+FINAL_CFLAGS+= -g -ggdb
+
+none:
 
 debug:
 ifneq ($(strip $(SUBDIRS)),)
@@ -17,13 +21,12 @@ ifneq ($(strip $(CLEAN_SUBDIRS)),)
 	@echo 'clean_subdirs -> [${CLEAN_SUBDIRS}]'
 endif
 
-all: programs subdirs
-programs: $(PROGS)
-%: %.c
-	$(CC) $(CFLAGS) -o $@$(EXE_SUFFIX) $<
-	@echo '============= $@ compile $< done ============='
+all: $(PROGS) $(SUBDIRS)
+%.out: %.c
+	$(CC) $(FINAL_CFLAGS) -o $*.o -c $<
+	$(CC) -o $@ $*.o
+	@echo '============= compile $< to $@ done ============='
 
-subdirs: $(SUBDIRS)
 $(SUBDIRS):
 	$(MAKE) -C $@ all
 
@@ -31,7 +34,7 @@ $(SUBDIRS):
 
 clean: clean_programs clean_subdirs
 clean_programs:
-	rm -f $(CLEAN_PROGS)
+	rm -f $(addsuffix .o, $(FILES)) $(PROGS)
 
 clean_subdirs: $(CLEAN_SUBDIRS)
 $(CLEAN_SUBDIRS):
