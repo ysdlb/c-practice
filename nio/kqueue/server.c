@@ -1,6 +1,7 @@
 #include <string.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 #include <stdio.h>
 #include <sys/time.h>
@@ -11,7 +12,7 @@
 #define NET_IP_STR_LEN 46       /* INET6_ADDRSTRLEN is 46 */
 
 #define ANET_OK 0
-#define ANET_ERR -1
+#define ANET_ERR (-1)
 
 /* Log levels */
 #define LL_DEBUG 0
@@ -36,6 +37,13 @@ const char *LEVEL_MAP[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 void _log_impl(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void log_raw(int level, const char *msg);
 int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog);
+
+typedef struct socketFds {
+    int fd[16];
+    int count;
+} socketFds;
+
+int createSocketAndListen(int _port, struct socketFds *sfd);
 
 void _log_impl(int level, const char *fmt, ...) {
     va_list ap;
@@ -67,34 +75,46 @@ void log_raw(int level, const char *msg) {
     // debug 模式下, printf 可能不会立马输出, 所以这里用 fprintf
     fprintf(fp, "[%s] [%s] [%d] - %s\n", level_info, time_buf, getpid(), msg);
 }
+/**
+ * 允许 socket fd 可重用
+ * 作用: 确保 基准测试 场景下, 频繁 开/关 socket 时不太影响性能
+ * @param err
+ * @param fd
+ * @return ERR if set fail, else return OK
+ */
+static int anetSetReuseAddr(int fd) {
+    int yes = 1;
+    /* Make sure connection-intensive things like the redis benchmark
+     * will be able to close/open sockets a zillion of times */
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
+        LOG(LL_ERROR, "setsockopt SO_REUSEADDR: %d", fd);
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
 
-//int create_socket_and_listen() {
-//    struct addrinfo *addr;
-//    struct addrinfo hints;
-//    memset(&hints, 0, sizeof(struct addrinfo));
-//    hints.ai_flags = AI_PASSIVE;
-//    hints.ai_family = PF_UNSPEC;
-//    hints.ai_socktype = SOCK_STREAM;
-//    getaddrinfo("127.0.0.1", "8080", &hints, &addr);
-//    int local_s = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-//    bind(local_s, addr->ai_addr, addr->ai_addrlen);
-//    listen(local_s, 5);
-//    return local_s;
-//}
-int create_socket_and_listen(char *host, char *port) {
+int createSocketAndListen(int port, struct socketFds *sfd) {
     struct addrinfo hints, *info;
+    char *host = NULL;
+    char _port[6]; /* strlen("65535") */
+    snprintf(_port, 6, "%d", port);
     int rv;
     // 初始化变量
-    memset(&hints, 0, sizeof(hints));
+    memset(&hints, 0, sizeof hints);
 
-    hints.ai_flags = AI_PASSIVE;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
 
-    if ((rv = getaddrinfo(host, port, &hints, &info)) != 0) {
+    if ((rv = getaddrinfo(host, _port, &hints, &info)) != 0) {
         LOG(LL_INFO, "%s", gai_strerror(rv));
         return ANET_ERR;
     }
+
+    int i = 0;
+    for (struct addrinfo *p = info; p != NULL; p = p->ai_next) i++;
+    // int fds[i];
+    // sfd->fd = fds;
 
     for (struct addrinfo *p = info; p != NULL; p = p->ai_next) {
         char ip_buf[NET_IP_STR_LEN];
@@ -117,11 +137,27 @@ int create_socket_and_listen(char *host, char *port) {
             LOG(LL_ERROR, "socket create error, address -> %s", ip_buf);
             continue;
         }
+        // 这里会出现两个地址, ipv6 的 "::" 和 ipv4 的 "0.0.0.0"
+        // ipv6 的地址必需要设置 socket 参数, 否则 ipv4 0.0.0.0 bind 必然失败,
+        // 返回 socket.error: [Errno 48] Address already in use <error.h#EADDRINUSE>
+        // 原因不了解, 参考: https://stackoverflow.com/questions/22126940/c-server-sockets-bind-error
+        int yes = 1;
+        if (p->ai_family == AF_INET6 && setsockopt(s_fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes,sizeof(yes)) == -1) {
+            LOG(LL_ERROR, "setsockopt: %s", strerror(errno));
+            return ANET_ERR;
+        }
+
+        LOG(LL_INFO, "yes -> %d", yes);
+        if (setsockopt(s_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
+            LOG(LL_ERROR, "setsockopt SO_REUSEADDR: %s", strerror(errno));
+            return ANET_ERR;
+        }
 
         if (anetListen(s_fd, p->ai_addr, p->ai_addrlen, 511) == ANET_ERR) {
-            LOG(LL_ERROR, "listen error, address -> %s", ip_buf);
+            LOG(LL_ERROR, "anetListen error, address -> %s", ip_buf);
             continue;
         }
+        sfd->fd[sfd->count++] = s_fd;
     }
     freeaddrinfo(info);
     return ANET_OK;
@@ -132,7 +168,7 @@ int create_socket_and_listen(char *host, char *port) {
  */
 int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog) {
     if (bind(socket_fd, sa, len) == -1) {
-        LOG(LL_ERROR, "bind error");
+        LOG(LL_ERROR, "bind error: %d", errno);
         close(socket_fd);
         return ANET_ERR;
     }
@@ -150,7 +186,9 @@ int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog) {
 int main(int argc, char **argv) {
     // 如何查看 pid 占用的所有端口 | pid all port
     // https://unix.stackexchange.com/questions/157823/list-ports-a-process-pid-is-listening-on-preferably-using-iproute2-tools
-    create_socket_and_listen("localhost", "9527");
+    struct socketFds socketFds;
+    memset(&socketFds, 0, sizeof(socketFds));
+    createSocketAndListen(9527, &socketFds);
     LOG(LL_INFO, "success!");
     return 0;
 }
