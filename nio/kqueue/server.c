@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sys/event.h>
 
 /* DNS lookup */
 #define NET_IP_STR_LEN 46       /* INET6_ADDRSTRLEN is 46 */
@@ -23,6 +24,15 @@
 
 #define LL_OUTPUT LL_DEBUG
 
+#define AE_NONE 0       /* No events registered. */
+#define AE_READABLE 1   /* Fire when descriptor is readable. */
+#define AE_WRITABLE 2   /* Fire when descriptor is writable. */
+#define AE_BARRIER 4    /* With WRITABLE, never fire the event if the
+                           READABLE event already fired in the same event
+                           loop iteration. Useful when you want to persist
+                           things to disk before sending replies, and want
+                           to do that in a group fashion. */
+
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
@@ -34,16 +44,28 @@
 
 const char *LEVEL_MAP[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 
+struct client_data {
+    int fd
+};
+struct client_data clients[128];
+
 void _log_impl(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void log_raw(int level, const char *msg);
 int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog);
+void sendWelcomeMsg(int fd);
+void recvMsg(int s);
+
 
 typedef struct socketFds {
     int fd[16];
     int count;
 } socketFds;
 
-int createSocketAndListen(int _port, struct socketFds *sfd);
+void eventLoop(int kqfd, socketFds *sfd);
+int createSocketAndListen(int _port, socketFds *sfd);
+int isNeedAccept(int ident, socketFds *sfd);
+void aeApiAddEvent(int kq_fd, int socket_fd, int mask);
+void aeApiRMEvent(int kq_fd, int socket_fd, int mask);
 
 void _log_impl(int level, const char *fmt, ...) {
     va_list ap;
@@ -75,24 +97,16 @@ void log_raw(int level, const char *msg) {
     // debug 模式下, printf 可能不会立马输出, 所以这里用 fprintf
     fprintf(fp, "[%s] [%s] [%d] - %s\n", level_info, time_buf, getpid(), msg);
 }
-/**
- * 允许 socket fd 可重用
- * 作用: 确保 基准测试 场景下, 频繁 开/关 socket 时不太影响性能
- * @param err
- * @param fd
- * @return ERR if set fail, else return OK
- */
-static int anetSetReuseAddr(int fd) {
-    int yes = 1;
-    /* Make sure connection-intensive things like the redis benchmark
-     * will be able to close/open sockets a zillion of times */
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
-        LOG(LL_ERROR, "setsockopt SO_REUSEADDR: %d", fd);
-        return ANET_ERR;
-    }
-    return ANET_OK;
-}
 
+/**
+ * 1. resolve address: function -> netdb.h#getaddrinfo
+ * 2. create socket: function -> socket.h#socket(int, int, int)
+ * 3. bind socket to address
+ * 4. listen on the socket for incoming connections
+ * @param port
+ * @param sfd
+ * @return
+ */
 int createSocketAndListen(int port, struct socketFds *sfd) {
     struct addrinfo hints, *info;
     char *host = NULL;
@@ -102,6 +116,11 @@ int createSocketAndListen(int port, struct socketFds *sfd) {
     // 初始化变量
     memset(&hints, 0, sizeof hints);
 
+    /**
+     * af 为 AF_UNSPEC, 且 getaddrinfo host 参数为 NULL 时, 会返回两个地址, 一个 ipv4, 一个为 ipv6
+     * 若只生成 ipv4 地址, 则 ai_family = AF_INET
+     * 若只生成 ipv6 地址, 则 ai_family = AF_INET6
+     */
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
@@ -147,6 +166,10 @@ int createSocketAndListen(int port, struct socketFds *sfd) {
             return ANET_ERR;
         }
 
+        /**
+         * 允许 socket fd 可重用
+         * 作用: 确保 基准测试 场景下, 频繁 开/关 socket 时不太影响性能
+         */
         LOG(LL_INFO, "yes -> %d", yes);
         if (setsockopt(s_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
             LOG(LL_ERROR, "setsockopt SO_REUSEADDR: %s", strerror(errno));
@@ -165,6 +188,8 @@ int createSocketAndListen(int port, struct socketFds *sfd) {
 
 /**
  * todo va_list error msg
+ * 1. bind socket to address: function -> socket.h#bind(int, const struct sockaddr *, socklen_t) __DARWIN_ALIAS(bind);
+ * 2. listen on the socket for incoming connections -> socket.h#listen(int, int) __DARWIN_ALIAS(listen)
  */
 int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog) {
     if (bind(socket_fd, sa, len) == -1) {
@@ -183,12 +208,118 @@ int anetListen(int socket_fd, struct sockaddr *sa, socklen_t len, int backlog) {
     return ANET_OK;
 }
 
+void eventLoop(int kqfd, socketFds *sfd) {
+    struct kevent keList[100];
+    struct sockaddr_storage addr;
+    size_t addr_len = sizeof addr;
+
+    while (1) {
+        struct timespec timeout;
+        timeout.tv_sec = 1;
+        int num_events = kevent(kqfd, NULL, 0, keList, 100, &timeout);
+        for(int i = 0; i < num_events; i++) {
+            struct kevent e = keList[i];
+            int ident = (int) e.ident;
+            if (isNeedAccept(ident, sfd)) {
+                // client 和 server 的交流将持续在这个 fd 上交互
+                int fd = accept(ident, (struct sockaddr *)&addr, (socklen_t *) &addr_len);
+                aeApiAddEvent(kqfd, fd, AE_READABLE);
+                sendWelcomeMsg(fd);
+            } else if (e.flags & EV_EOF) {
+                int fd = ident;
+                aeApiRMEvent(kqfd, fd, AE_READABLE);
+                LOG(LL_INFO, "client %d disconnected", fd);
+            } else if (e.filter == EVFILT_READ) {
+                int fd = ident;
+                // accept 到的 fd
+                recvMsg(fd);
+            }
+        }
+    }
+}
+
+int isNeedAccept(int ident, struct socketFds *sfd) {
+    for (int i = 0; i < sfd->count; i++) {
+        if (ident == sfd->fd[i])
+            return ident;
+    }
+    return 0;
+}
+
+/**
+ * bind kqueue fd and socket fd
+ */
+void aeApiAddEvent(int kq_fd, int socket_fd, int mask) {
+    struct kevent ke;
+    if (mask & AE_READABLE) {
+        EV_SET(&ke, socket_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+        if (kevent(kq_fd, &ke, 1, NULL, 0, NULL) == -1) {
+            LOG(LL_ERROR, "AE_READABLE bind %d and %d error", kq_fd, socket_fd);
+        }
+    }
+
+    if (mask & AE_WRITABLE) {
+        EV_SET(&ke, socket_fd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
+        if (kevent(kq_fd, &ke, 1, NULL, 0, NULL) == -1) {
+            LOG(LL_ERROR, "AE_WRITABLE bind %d and %d error", kq_fd, socket_fd);
+        }
+    }
+}
+
+void aeApiRMEvent(int kq_fd, int socket_fd, int mask) {
+    struct kevent ke;
+    if (mask & AE_READABLE) {
+        EV_SET(&ke, socket_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        if (kevent(kq_fd, &ke, 1, NULL, 0, NULL) == -1) {
+            LOG(LL_ERROR, "AE_READABLE delete %d and %d error", kq_fd, socket_fd);
+        }
+    }
+
+    if (mask & AE_WRITABLE) {
+        EV_SET(&ke, socket_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        if (kevent(kq_fd, &ke, 1, NULL, 0, NULL) == -1) {
+            LOG(LL_ERROR, "AE_WRITABLE delete %d and %d error", kq_fd, socket_fd);
+        }
+    }
+}
+
+void sendWelcomeMsg(int fd) {
+    char msg[80];
+    sprintf(msg, "welcome! you are client #%d!\n", fd);
+    send(fd, msg, strlen(msg), 0);
+}
+
+void recvMsg(int s) {
+    char buf[1024];
+    ssize_t bytes_read = recv(s, buf, sizeof(buf) - 1, 0);
+    buf[bytes_read] = 0;
+    printf("client #%d: %s", s, buf);
+    fflush(stdout);
+}
+
+/**
+ * nio 的 kqueue 实现, 主要参考
+ * 1. redis
+ * 2. https://nima101.github.io/kqueue_server
+ */
 int main(int argc, char **argv) {
     // 如何查看 pid 占用的所有端口 | pid all port
     // https://unix.stackexchange.com/questions/157823/list-ports-a-process-pid-is-listening-on-preferably-using-iproute2-tools
     struct socketFds socketFds;
     memset(&socketFds, 0, sizeof(socketFds));
     createSocketAndListen(9527, &socketFds);
-    LOG(LL_INFO, "success!");
+    LOG(LL_INFO, "createSocketAndListen success!");
+
+    // 创建 kqueue fd 和 event 数组
+    int kqfd = kqueue();
+
+    // 绑定 socket 和 event 数组
+    // 绑定 kevent 和 socket
+    for (int i = 0; i < socketFds.count; i++) {
+        aeApiAddEvent(kqfd, socketFds.fd[i], AE_READABLE);
+    }
+
+    // nio 监听
+    eventLoop(kqfd, &socketFds);
     return 0;
 }
