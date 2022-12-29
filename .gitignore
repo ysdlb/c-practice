@@ -1,3 +1,15 @@
+### gitignore binary files that have no extension
+### copy from: https://stackoverflow.com/questions/5711120/gitignore-binary-files-that-have-no-extension
+# Ignore all
+*
+# Unignore all with extensions
+!*.*
+# Unignore all dirs
+!*/
+# Unignore Some file with no extensions
+!Makefile
+### Above combination will ignore all files without extension ###
+
 .*.swp
 *.o
 *.out
@@ -10,6 +22,7 @@ misc/*
 .make-*
 .prerequisites
 *.dSYM
+.DS_Store
 
 .vscode/*
 .idea/*
